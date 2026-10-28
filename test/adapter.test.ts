@@ -1449,6 +1449,18 @@ test('multimodal: stages attached images and forwards path with view_file instru
   const prompt2 = argv2[argv2.indexOf('-p') + 1] ?? ''
   assert.ok(prompt2.includes('[image attached: "img_test_2"'))
   assert.ok(prompt2.includes('[Please inspect the attached image(s) using view_file and assist the user.]'))
+
+  // Host mode excludes view_file; attachment instructions must use the actual
+  // DSH image tool and its schema instead of directing the model to a dead tool.
+  const { adapter: host } = makeAdapter({ userEnvironmentMode: 'shared' }, {
+    readImage: async () => pngData,
+    prepareHostTools: async () => ({ agentName: 'host-images', env: {}, dispose: async () => undefined }),
+  })
+  await runTurn(host, [imgOnlyMsg], { sessionId: 'sess-host-img' as never })
+  const argv3 = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+  const prompt3 = argv3[argv3.indexOf('-p') + 1] ?? ''
+  assert.match(prompt3, /read_image tool with file_path/)
+  assert.ok(!prompt3.includes('view_file'))
 })
 
 test('identical prompt while a live run owns the session is rejected with BUSY (issue #33)', async () => {
@@ -2105,4 +2117,39 @@ test('a NUL byte in history cannot fail the turn with a spawn TypeError', async 
     if (prevArgs === undefined) delete process.env.FAKE_AGY_ARGS_FILE
     else process.env.FAKE_AGY_ARGS_FILE = prevArgs
   }
+})
+
+test('host execution owns its capability cleanup and never resumes a native conversation', { timeout: 5000 }, async () => {
+  let prepared = 0; let disposed = 0
+  const { adapter, store, argsFile } = makeAdapter({ userEnvironmentMode: 'shared' }, {
+    prepareHostTools: async input => {
+      assert.equal(input.sessionId, 'host-contract')
+      assert.equal(input.permissionMode, 'plan')
+      prepared++
+      return { agentName: 'test-host-agent', env: { DSH_MCP_RUN_TOKEN: 'test-capability' }, dispose: async () => { disposed++ } }
+    },
+  })
+  store.set('host-contract', { conversationId: 'native-conversation-must-not-resume', lastMessageCount: 1, updatedAt: Date.now() })
+  const previousMode = process.env.FAKE_AGY_MODE; const previousArgs = process.env.FAKE_AGY_ARGS_FILE
+  try {
+    process.env.FAKE_AGY_MODE = 'ok'; process.env.FAKE_AGY_ARGS_FILE = argsFile
+    await runTurn(adapter, [msg('user', 'host execution fixture')], { sessionId: 'host-contract' as never })
+    const args = JSON.parse(readFileSync(argsFile, 'utf8')) as string[]
+    assert.equal(args[args.indexOf('--agent') + 1], 'test-host-agent')
+    assert.ok(!args.includes('--conversation'))
+    assert.ok(args.includes('--dangerously-skip-permissions'))
+    assert.equal(prepared, 1)
+    await waitFor(() => disposed === 1 ? true : undefined)
+    assert.equal(store.get('host-contract')?.conversationId, 'native-conversation-must-not-resume')
+    assert.equal(store.get('host-contract|host-tools-v2:default')?.conversationId, 'conv-fresh-1')
+  } finally {
+    if (previousMode === undefined) delete process.env.FAKE_AGY_MODE; else process.env.FAKE_AGY_MODE = previousMode
+    if (previousArgs === undefined) delete process.env.FAKE_AGY_ARGS_FILE; else process.env.FAKE_AGY_ARGS_FILE = previousArgs
+  }
+})
+
+test('host execution refuses an unavailable bridge without spawning a native fallback', { timeout: 5000 }, async () => {
+  const { adapter } = makeAdapter({ userEnvironmentMode: 'shared' }, { prepareHostTools: async () => { throw new Error('host bridge unavailable') } })
+  await assert.rejects(() => collect(adapter.stream(opts([msg('user', 'must fail closed')], { sessionId: 'host-unavailable' as never }))), /host bridge unavailable/)
+  await assert.rejects(() => collect(adapter.stream(opts([msg('user', 'must fail closed')], { sessionId: 'host-unavailable' as never }))), /host bridge unavailable/)
 })

@@ -11,6 +11,9 @@ import { dshHome, overridesPath, readOverrides, resolveConfig, stateDir } from '
 import { PLUGIN_ID, PROVIDER_ID, type PluginConfig } from './common/types.ts'
 import type { ManagedAccount } from './common/pool-types.ts'
 import { AgyAdapter } from './host/adapter.ts'
+import { accountProcessEnvironment, userEnvironmentStatus } from './host/user-environment.ts'
+import { encodeHostToolContent } from './host/host-tool-content.ts'
+import { createHostToolPlugin, createHostToolProfile, hostToolSchemas, executeHostTool } from './host/host-tools.ts'
 import { defineAgyAskTool } from './host/ask-tool.ts'
 import { AuthHelper } from './host/auth.ts'
 import { agyCommandDefinition } from './host/commands.ts'
@@ -29,7 +32,7 @@ import { resolvePrimaryCredential, findDuplicateCredentialIdentities } from './h
 import { homedir } from 'node:os'
 import { StreamJsonParser } from './host/parser.ts'
 import { defaultMediaDir, sweepDir, type ImageRefLike } from './host/media.ts'
-import { agyMcpConfigPath, startMcpBridge, writeMcpConfig, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
+import { agyMcpConfigPath, mcpServerKey, startMcpBridge, writeMcpConfig, type McpBridge, type ToolsServiceLike } from './host/mcp-bridge.ts'
 import { fileURLToPath } from 'node:url'
 import { handleMediaRequest, handleAssetRequest, type HttpRequestLike, type HttpResponseLike } from './host/media-route.ts'
 
@@ -158,7 +161,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
   const getDiscoveryEnv = (account?: ManagedAccount): NodeJS.ProcessEnv => {
     const cfg = getConfig()
     return {
-      ...process.env,
+      ...accountProcessEnvironment(account?.dir ?? '', cfg.userEnvironmentMode),
       ...(cfg.disableTelemetry
         ? {
             DO_NOT_TRACK: '1',
@@ -167,7 +170,6 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
             ANTIGRAVITY_DISABLE_TELEMETRY: '1',
           }
         : {}),
-      ...(account && account.dir ? isolatedHomeEnv(account.dir) : {}),
       ...proxyEnvFor(account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined),
     }
   }
@@ -269,8 +271,74 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
 
   const webServerPort: { current?: number } = {}
 
+  // Host execution has a separate strict bridge; legacy MCP settings cannot
+  // downgrade its session capabilities or expose arbitrary DSH transports.
+  let hostBridgePromise: Promise<McpBridge> | null = null
+  const hostPlugins = new Map<string, ReturnType<typeof createHostToolPlugin>>()
+  const hostToolsNamespace = () => webServerPort.current ? 'web-' + webServerPort.current : 'process-' + process.pid
+  let hostBridgeDisposed = false
+  const hostToolsSupported = () => process.platform === 'darwin' && versionCache === '1.4.8' && Boolean(ctx.get('tools'))
+  const getHostBridge = (): Promise<McpBridge> => {
+    if (!hostBridgePromise) {
+      hostBridgePromise = startMcpBridge({
+        bridgeScript: fileURLToPath(new URL('./bridge.mjs', import.meta.url)),
+        tools: () => ctx.get('tools') as ToolsServiceLike | undefined,
+        allowlist: () => '',
+        requireRun: () => true,
+        resolveAgent: id => (ctx.get('agents') as { get(id: string): unknown } | undefined)?.get(id),
+        executeTool: async input => {
+          const tools = ctx.get('tools') as ToolsServiceLike | undefined
+          if (!tools) throw new Error('DSH tools unavailable')
+          const result = await executeHostTool(tools, input, ctx.get('ptcRuntime') as { language?: string; programFormat?: string } | undefined)
+          return encodeHostToolContent(result, input.signal, async (ref, signal) => {
+            const attachments = ctx.get('attachments') as { readImage?: (ref: ImageRefLike, signal: AbortSignal) => Promise<{ data?: Uint8Array } | null> } | undefined
+            if (!attachments?.readImage) throw new Error('DSH attachment storage is unavailable')
+            return attachments.readImage(ref, signal)
+          }, input.name)
+        },
+        log,
+      }).then(async bridge => {
+        if (hostBridgeDisposed) { await bridge.close(); throw new Error('Host tools disposed') }
+        return bridge
+      }).catch(error => { hostBridgePromise = null; throw error })
+    }
+    return hostBridgePromise
+  }
+  ctx.effect(() => () => {
+    hostBridgeDisposed = true
+    for (const plugin of hostPlugins.values()) plugin.dispose()
+    hostPlugins.clear()
+    void hostBridgePromise?.then(bridge => bridge.close()).catch(() => undefined)
+  })
+
   const adapter = new AgyAdapter({
     getConfig,
+    hostToolsNamespace,
+    prepareHostTools: async ({ sessionId, accountHome, signal, permissionMode, auxiliary }) => {
+      if (!hostToolsSupported()) throw new Error('Host execution requires macOS agy 1.4.8 and DSH tools')
+      if (auxiliary) {
+        const profile = createHostToolProfile({ accountHome,
+          hookScript: fileURLToPath(new URL('./host-tools-hook.mjs', import.meta.url)), schemas: [] })
+        return { agentName: profile.name, env: { DSH_HOST_MCP_SERVER: '', DSH_MCP_RUN_TOKEN: '' }, dispose: async () => profile.dispose() }
+      }
+      if (!sessionId) throw new Error('Host execution requires a DSH session')
+      const agent = (ctx.get('agents') as { get(id: string): unknown } | undefined)?.get(sessionId)
+      const tools = ctx.get('tools') as ToolsServiceLike | undefined
+      if (!agent || !tools) throw new Error('The DSH session is unavailable; no host tools were executed')
+      const schemas = hostToolSchemas(tools, agent, permissionMode)
+      if (permissionMode !== 'plan' && !schemas.some(s => s.name === 'bash' || s.name === 'pwsh')) throw new Error('This DSH session has no host shell tool')
+      const bridge = await getHostBridge()
+      if (signal.aborted || hostBridgeDisposed) throw new Error('Host execution was cancelled')
+      let plugin = hostPlugins.get(accountHome + ':' + hostToolsNamespace())
+      if (!plugin) { plugin = createHostToolPlugin({ accountHome, namespace: hostToolsNamespace(), bridge }); hostPlugins.set(accountHome + ':' + hostToolsNamespace(), plugin) }
+      const lease = bridge.registerRun({ sessionId, signal, allowedTools: schemas.map(s => s.name) })
+      try {
+        const profile = createHostToolProfile({ accountHome, plugin,
+          hookScript: fileURLToPath(new URL('./host-tools-hook.mjs', import.meta.url)), schemas })
+        return { agentName: profile.name, env: { DSH_MCP_RUN_TOKEN: lease.token, DSH_HOST_MCP_SERVER: profile.serverName },
+          dispose: async () => { try { await lease.dispose() } finally { profile.dispose() } } }
+      } catch (error) { await lease.dispose(); throw error }
+    },
     catalog,
     store,
     pool,
@@ -606,6 +674,7 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
           dormantReason,
           enabled: cfg.enabled,
           permissionMode: cfg.permissionMode,
+          userEnvironment: userEnvironmentStatus(cfg.userEnvironmentMode, hostToolsSupported()),
           workspaceRoot: cfg.workspaceRoot,
           defaultModel: cfg.defaultModel,
           defaultEffort: cfg.defaultEffort,
@@ -924,10 +993,20 @@ export function apply(ctx: Context, entryConfig: Record<string, unknown> = {}): 
         }
         const body = await readBody(req)
         const key = typeof body.key === 'string' ? body.key : ''
-        const allowed = ['permissionMode', 'defaultModel', 'defaultEffort', 'askTool', 'workspaceRoot', 'hiddenModels']
+        const allowed = ['permissionMode', 'defaultModel', 'defaultEffort', 'askTool', 'workspaceRoot', 'hiddenModels', 'userEnvironmentMode']
         if (!allowed.includes(key)) {
           sendJson(res as RawRes, 400, { error: 'key not settable' })
           return
+        }
+        if (key === 'userEnvironmentMode') {
+          if (body.value !== 'isolated' && body.value !== 'shared') {
+            sendJson(res as RawRes, 400, { error: 'userEnvironmentMode must be isolated or shared' })
+            return
+          }
+          if (body.value === 'shared' && !userEnvironmentStatus('shared', hostToolsSupported()).sharedAvailable) {
+            sendJson(res as RawRes, 409, { error: 'Host command environment requires compatible DSH tools and macOS agy 1.4.8; account authentication remains isolated', code: userEnvironmentStatus('shared').reason })
+            return
+          }
         }
         if (key === 'hiddenModels' && (!Array.isArray(body.value) || !(body.value as unknown[]).every((x) => typeof x === 'string'))) {
           sendJson(res as RawRes, 400, { error: 'hiddenModels must be an array of model ids' })

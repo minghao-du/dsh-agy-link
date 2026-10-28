@@ -7,6 +7,7 @@ export const PLUGIN_ID = 'agy-link'
 export const PKG_NAME = 'dsh-agy-link'
 
 export type PermissionMode = 'skip' | 'plan' | 'accept-edits'
+export type UserEnvironmentMode = 'isolated' | 'shared'
 
 export interface FallbackModelDef {
   id: string
@@ -17,6 +18,8 @@ export interface FallbackModelDef {
 
 export interface PluginConfig {
   enabled: boolean
+  /** Shared mode stays unavailable until account isolation is validated. */
+  userEnvironmentMode: UserEnvironmentMode
   /** Absolute path to the agy binary; empty string = resolve from PATH. */
   agyBin: string
   /** Extra argv appended to every spawn (escape hatch). */
@@ -148,6 +151,7 @@ export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
 
 export function defaultConfig(): PluginConfig {
   return {
+    userEnvironmentMode: 'isolated',
     enabled: true,
     agyBin: '',
     extraArgs: [],

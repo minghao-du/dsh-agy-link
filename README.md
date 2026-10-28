@@ -58,6 +58,7 @@
 你拥有多个 Google Antigravity / Gemini 账号？**dsh-agy-link 让多账号管理变得极致简单与自动化**：
 
 - 👥 **多账号池化管理 (Account Pool)**：在 DSH 内添加任意数量的 Google 账号（主账号 + 备用账号群），每个账号拥有独立的 HOME 目录沙箱与凭证隔离。
+  「使用本机命令环境」通过 DSH 宿主工具执行：普通命令与文件操作遵循 DSH 原有权限，默认使用当前会话目录；AGY 次账号 HOME 始终隔离。继承 DSH 启动时的环境，不复现其他终端临时激活的 Conda。此模式暂不提供 AGY 原生子代理、浏览器或第三方 MCP；计划模式只有只读文件工具，无终端。当前仅适配 macOS 官方 agy 1.4.8，其他版本仍禁用；已通过本机两个真实 Claude 账号的 CSV 工具执行与连续对话验证；详细验证边界见下文链接。详见[功能状态与验收要求](./docs/shared-user-environment-feasibility.md)。
 - 🔄 **顺序耗尽故障转移 (Sequential Drain)**：当前账号额度用尽（触发 429 限流或 5h / 周额度耗尽）时，系统**自动平滑接力至下一个可用账号**，对话完全不中断！
 - 🕰 **额度到期优先轮换 (Quota-Expiry-First)**：多个账号可用时，优先切换到**重置窗口最早到期**的账号，把"还剩很久才重置"的额度留给后面，整体池化利用率最大化。
 - 🧠 **网络抖动智能甄别 (Jitter-Safe Auth)**：代理抖动导致的 keyring 鉴权超时会被自动识别为**可重试的网络错误**而非"登录失效"——基于 agy 本次运行日志的 `keyringAuth` 传输证据精准分类，且粘性"需重新登录"隔离需二次确认，健康账号绝不会被误标。
@@ -242,6 +243,7 @@ Bring **Google Antigravity models into DeepSeek Harness (DSH)** — featuring **
 Have multiple Google Antigravity / Gemini accounts? **dsh-agy-link makes multi-account orchestration seamless and automated**:
 
 - 👥 **Multi-Account Pooling**: Manage unlimited Google accounts (Primary + Secondary pool) with fully isolated HOME sandbox environments and credentials.
+  “Use local command environment” runs through DSH host tools: commands and file operations retain DSH permissions and default to the current session directory, while secondary AGY account HOME directories remain isolated. It inherits the environment used to start DSH, not Conda environments temporarily activated in another terminal. AGY native subagents, browser tools, and third-party MCP are unavailable in this mode; plan mode offers read-only file tools without a terminal. Currently adapted only for official agy 1.4.8 on macOS; other versions remain disabled. Local CSV execution and continuation were verified with two real Claude accounts; see the linked report for remaining validation boundaries. See [feature status and acceptance requirements](./docs/shared-user-environment-feasibility.md).
 - 🔄 **Sequential Drain Failover**: When an account reaches its rate limits (429) or runs out of 5h/weekly quotas, requests **automatically and smoothly fail over to the next available account** without interrupting your conversation!
 - 🕰 **Quota-Expiry-First Rotation**: With several accounts available, the scheduler prefers the one whose **reset window expires soonest**, maximizing utilization across the whole pool.
 - 🧠 **Jitter-Safe Auth Classification**: A keyring-auth timeout caused by proxy jitter is recognized as a **retryable network error**, not a sign-out — classified from the `keyringAuth` transport evidence in agy's own run log, and sticky "needs re-login" quarantine requires a second confirmation, so healthy accounts are never falsely flagged.

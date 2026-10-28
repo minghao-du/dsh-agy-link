@@ -94,6 +94,7 @@ export function resolveConfig(
   }
   const cfg: PluginConfig = {
     ...base,
+    userEnvironmentMode: get('userEnvironmentMode') === 'shared' ? 'shared' : base.userEnvironmentMode,
     enabled: asBool(get('enabled')) ?? base.enabled,
     agyBin: asString(get('agyBin')) ?? base.agyBin,
     extraArgs: Array.isArray(get('extraArgs'))
@@ -143,6 +144,9 @@ export function resolveConfig(
     suppressAgyAutoUpdate: asBool(get('suppressAgyAutoUpdate')) ?? base.suppressAgyAutoUpdate,
   }
   // Env wins last (spec ADR-13).
+  if (env.DSH_AGY_USER_ENVIRONMENT_MODE === 'isolated' || env.DSH_AGY_USER_ENVIRONMENT_MODE === 'shared') {
+    cfg.userEnvironmentMode = env.DSH_AGY_USER_ENVIRONMENT_MODE
+  }
   if (env.DSH_AGY_ENABLED !== undefined) cfg.enabled = asBool(env.DSH_AGY_ENABLED) ?? cfg.enabled
   if (env.DSH_AGY_BIN) cfg.agyBin = env.DSH_AGY_BIN
   if (env.DSH_AGY_MODE) {

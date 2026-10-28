@@ -17,7 +17,8 @@ import { parseMirrorCallId, type RunRecording, type RunRegistry } from './record
 import { accountHasArgon, defaultEffortFor, findEntry, isArgonModel, ModelCatalog, resolveModelSlug, sanitizeCatalogEntries } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
-import { ensureIsolatedKeychain, isolatedHomeEnv, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
+import { ensureIsolatedKeychain, proxyEnvFor, startAgyProcess, buildStreamInputLine, shouldUsePromptStdin, stripNulBytes } from './runner.ts'
+import { accountProcessEnvironment } from './user-environment.ts'
 import { detectSystemProxy } from './wincred.ts'
 import { AbortedWaitError, WaitTimeoutError, acquireCredentialSlot, credentialSlotMutex, SlotUnavailableError, armSlotHandoff, type SlotHandoff } from './credential-slot.ts'
 import { agyHomeDirFor, readAgyRunLogText, snapshotAgyLogs } from './agy-log.ts'
@@ -347,6 +348,10 @@ export function buildDigest(messages: readonly Message[], fromIdx: number, maxCh
 
 export interface AgyAdapterDeps {
   getConfig: () => PluginConfig
+  hostToolsNamespace?: () => string
+  prepareHostTools?: (input: { sessionId: string; accountHome: string; signal: AbortSignal; permissionMode: PluginConfig['permissionMode']; auxiliary?: boolean }) => Promise<{
+    agentName: string; env: Record<string, string>; dispose(): Promise<void>
+  }>
   catalog: ModelCatalog
   store: SessionStore
   pool?: AccountPoolManager
@@ -1196,9 +1201,12 @@ export class AgyAdapter extends LlmAdapter {
     // families the user is not currently running).
     if (account && !isAux) this.deps.pool?.markAccountActive(account.id)
 
-    const sessionAccountKey = account ? `${sessionKey}:${account.id}` : sessionKey
+    // Execution domains never share an agy continuation: native tasks and
+    // permissions from an old domain must not leak into a host-tools session.
+    const sessionDomain = cfg.userEnvironmentMode === 'shared' ? sessionKey + '|host-tools-v2:' + (this.deps.hostToolsNamespace?.() ?? 'default') : sessionKey
+    const sessionAccountKey = account ? `${sessionDomain}:${account.id}` : sessionDomain
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
-    if (binding === undefined && sessionKey !== '') {
+    if (binding === undefined && sessionKey !== '' && cfg.userEnvironmentMode !== 'shared') {
       binding = this.deps.store.get(sessionKey)
       if (binding === undefined && account === undefined) {
         for (const [k, b] of Object.entries(this.deps.store.all())) {
@@ -1219,7 +1227,7 @@ export class AgyAdapter extends LlmAdapter {
     // there produced "conversation not found" plus a wasted turn.
     if (binding === undefined && !isAux && sessionKey !== '') {
       const live = this.activeRuns.get(sessionKey)
-      const liveCid = live !== undefined && !live.isSettled && (live.accountHome ?? '') === (account?.dir ?? '')
+      const liveCid = live !== undefined && !live.isSettled && (live.accountHome ?? '') === (account?.dir ?? '') && live.hostTools === (cfg.userEnvironmentMode === 'shared')
         ? live.conversationId
         : null
       if (liveCid) {
@@ -1392,9 +1400,10 @@ export class AgyAdapter extends LlmAdapter {
           maxBytes: cfg.mediaMaxBytes,
         })
         if (res.promptSuffix !== '') {
+          const imagePrompt = cfg.userEnvironmentMode === 'shared' ? res.promptSuffix.replace(/view_file tool with AbsolutePath/g, 'read_image tool with file_path') : res.promptSuffix
           prompt = prompt === ''
-            ? (res.promptSuffix + '\n\n[Please inspect the attached image(s) using view_file and assist the user.]')
-            : (prompt + '\n\n' + res.promptSuffix)
+            ? (imagePrompt + '\n\n[Please inspect the attached image(s) using ' + (cfg.userEnvironmentMode === 'shared' ? 'read_image' : 'view_file') + ' and assist the user.]')
+            : (prompt + '\n\n' + imagePrompt)
         }
         if (res.staged.length > 0) stagedDirs = [dir]
         // Mark ids we actually staged (not skipped/unreadable) so the next
@@ -1433,7 +1442,7 @@ export class AgyAdapter extends LlmAdapter {
       const liveRun = this.activeRuns.get(sessionKey)
       const runLive = liveRun !== undefined && !liveRun.isSettled
       const samePrompt = prevPrompt !== undefined && prevPrompt.prompt === prompt
-      if (runLive && samePrompt) {
+      if (runLive && samePrompt && liveRun.hostTools === (cfg.userEnvironmentMode === 'shared')) {
         // RESCUE before BUSY: an identical prompt for a session whose run is
         // still alive is normally a continuation span — but when the trailing
         // mirror result failed to parse as one (malformed callId, harness-side
@@ -1475,12 +1484,12 @@ export class AgyAdapter extends LlmAdapter {
       }
       // Steer: a NEW prompt arrives while the previous run is still live.
       // Abort it so two agy processes never append to the same conversation.
-      if (runLive && !samePrompt) {
+      if (runLive && (!samePrompt || liveRun.hostTools !== (cfg.userEnvironmentMode === 'shared'))) {
         // Harvest the live conversation id BEFORE aborting: a tool-cut or
         // caller abort used to drop the binding entirely, so the replacement
         // process started a brand-new agy conversation with digest-only
         // prompt (issue #35 root cause ②).
-        const liveCid = (liveRun.accountHome ?? '') === (account?.dir ?? '') ? liveRun.conversationId : null
+        const liveCid = (liveRun.accountHome ?? '') === (account?.dir ?? '') && liveRun.hostTools === (cfg.userEnvironmentMode === 'shared') ? liveRun.conversationId : null
         if (
           liveCid !== null &&
           binding === undefined &&
@@ -1530,6 +1539,7 @@ export class AgyAdapter extends LlmAdapter {
     // ---- spawn + record (v0.3: spans consume a shared recording) ----
     const rec = this.deps.runs.create()
     rec.accountHome = account && account.dir ? account.dir : undefined
+    rec.hostTools = cfg.userEnvironmentMode === 'shared'
     // The fallback conversation-id discovery must watch the SAME HOME the
     // child runs under: an isolated pool account's conversation DB lives in
     // its own HOME and the system-HOME snapshot never sees it.
@@ -1885,7 +1895,7 @@ export class AgyAdapter extends LlmAdapter {
     const runLogsBefore = snapshotAgyLogs(runLogHome)
     const effectiveProxy = account?.proxyUrl || cfg.proxyUrl || detectSystemProxy() || undefined
     const env = {
-      ...process.env,
+      ...accountProcessEnvironment(account?.dir ?? '', cfg.userEnvironmentMode),
       // Identity for the MCP reverse bridge (issue #55): agy passes its env to
       // the MCP server it spawns, so the bridge script learns which DSH session
       // this run belongs to and the host can resolve the calling agent.
@@ -1898,11 +1908,15 @@ export class AgyAdapter extends LlmAdapter {
             ANTIGRAVITY_DISABLE_TELEMETRY: '1',
           }
         : {}),
-      ...(account && account.dir ? isolatedHomeEnv(account.dir) : {}),
       // Dedicated account proxy wins, then global config proxy, then detected system proxy.
       ...proxyEnvFor(effectiveProxy),
     }
 
+    let hostTools: Awaited<ReturnType<NonNullable<AgyAdapterDeps['prepareHostTools']>>> | undefined
+    const disposeHostTools = async () => {
+      try { await hostTools?.dispose() }
+      catch (error) { this.deps.log?.('Host tool cleanup failed: ' + brief(String(error))) }
+    }
     let proc: ReturnType<typeof startAgyProcess>
     let spawned = false
     try {
@@ -1945,6 +1959,16 @@ export class AgyAdapter extends LlmAdapter {
           },
           log: (msg) => this.deps.log?.(msg),
         })
+      }
+      if (cfg.userEnvironmentMode === 'shared') {
+        if (!this.deps.prepareHostTools) throw new Error('DSH host execution is unavailable')
+        if (cfg.extraArgs.some(arg => /^(?:--agent|--mode|--conversation|--continue|--sandbox|-c)(?:=|$)/.test(arg))) throw new Error('Host execution cannot combine with agent/mode/conversation extraArgs')
+        hostTools = await this.deps.prepareHostTools({ sessionId: sessionKey, accountHome: account?.dir ?? '',
+          signal: options.signal ?? new AbortController().signal, permissionMode: isAux ? 'plan' : cfg.permissionMode, auxiliary: isAux })
+        // Only the guarded MCP gateway is available to agy. DSH owns tool
+        // approval; agy must not prompt a second time for the gateway itself.
+        args.push('--agent', hostTools.agentName, '--dangerously-skip-permissions')
+        Object.assign(env, hostTools.env)
       }
       proc = startAgyProcess({
       bin,
@@ -2019,6 +2043,7 @@ export class AgyAdapter extends LlmAdapter {
       // would ever return the concurrency slot. releaseOnce() no-ops when the
       // catch already released.
       if (!spawned) {
+        await disposeHostTools()
         releaseOnce()
         this.clearInFlightPrompt(sessionKey, prompt)
       }
@@ -2026,6 +2051,7 @@ export class AgyAdapter extends LlmAdapter {
 
     void (async () => {
       const outcome = await proc.outcome
+      await disposeHostTools()
       releaseOnce()
       stopToolHeartbeat()
       openToolKeys.clear()

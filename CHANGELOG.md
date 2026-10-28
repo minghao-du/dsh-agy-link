@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### 中文
+
+- 添加「使用本机命令环境」设置与有效模式状态。新路径：AGY 保持原有账号 HOME 隔离，普通命令与文件操作经 MCP 桥交给 DSH 宿主工具，继续遵循 DSH 权限，默认使用当前会话工作目录。`shared` 表示工具执行环境，不表示共享 AGY HOME。
+- 增加每次运行的会话绑定能力令牌、执行端工具白名单及取消传播；移除已在 macOS / agy 1.4.8 上复现串号的恢复系统 HOME 分支。
+- 当前仅适配 macOS 官方 agy 1.4.8，其他平台或版本仍禁用。此模式暂不提供原生子代理、浏览器和第三方 MCP；计划模式仅提供只读文件工具，无终端。继承 DSH 启动环境，不复现其他终端临时激活的 Conda。已通过本机两个真实 Claude 账号的 CSV 执行和连续对话验证。
+
+### English
+
+- Add “Use local command environment” and effective-mode reporting. The new path: AGY retains existing account HOME isolation while commands and file operations run through DSH host tools over MCP, preserving DSH permissions and defaulting to the current session directory. `shared` describes the tool execution environment, not shared AGY HOME.
+- Add per-run session-bound capabilities, execution-side tool allowlists, and cancellation propagation. Remove the system-HOME restoration branch that reproduced account mixing on macOS / agy 1.4.8.
+- Currently adapted only for official agy 1.4.8 on macOS; other platforms and versions remain disabled. Native subagents, browser tools, and third-party MCP are unavailable in this mode; plan mode provides read-only file tools without a terminal. Inherits the DSH startup environment, not Conda environments temporarily activated in another terminal. Local CSV execution and continuation were verified with two real Claude accounts.
+
 ## 0.4.72 (2026-10-27)
 
 ### English

@@ -71,6 +71,12 @@ interface StatusPayload {
 	dormantReason?: string | null;
 	enabled?: boolean;
 	permissionMode?: string;
+	userEnvironment?: {
+		requestedMode: 'isolated' | 'shared';
+		effectiveMode: 'isolated' | 'shared';
+		sharedAvailable: boolean;
+		reason: string;
+	};
 	workspaceRoot?: string;
 	defaultModel?: string;
 	defaultEffort?: string;
@@ -2156,6 +2162,21 @@ h('div', { key: 'agy-body', style: S.quotaBox },
 			renderedAccountCards,
 			h('div', { style: { marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--agy-border-divider)' } },
 				h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
+					h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+						h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+							h('span', { style: { color: 'var(--agy-text-primary)', fontWeight: 600, fontSize: '12.5px' } }, t('environment.label')),
+							h('div', { role: 'group', 'aria-label': t('environment.label'), style: S.segGroup },
+								...(['isolated', 'shared'] as const).map(mode => h('button', {
+									type: 'button',
+									'aria-pressed': (status.userEnvironment?.effectiveMode ?? 'isolated') === mode,
+									style: (status.userEnvironment?.effectiveMode ?? 'isolated') === mode ? S.segBtnActive : S.segBtn,
+									disabled: loadingAction === 'config:userEnvironmentMode' || (mode === 'shared' && !status.userEnvironment?.sharedAvailable),
+									onClick: () => void setCfg('userEnvironmentMode', mode),
+								}, t(mode === 'shared' ? 'environment.sharedOption' : 'environment.isolatedOption'))),
+							),
+						),
+						!status.userEnvironment?.sharedAvailable ? h('span', { style: S.muted }, t('environment.unavailable')) : null,
+					),
 					h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
 						h('span', { style: { color: 'var(--agy-text-primary)', fontWeight: 600, fontSize: '12.5px' } }, t('permission.label')),
 						h('div', { style: S.segGroup },

@@ -28,6 +28,7 @@ test('mcp bridge: loopback endpoint serves tools and executes calls', async () =
     bridgeScript: resolve(here, '../dist/bridge.mjs'),
     tools: () => fakeTools,
     allowlist: () => '',
+    resolveAgent: (id) => id === 'legacy-session' ? { id } : undefined,
   })
   try {
     // no token -> 401
@@ -43,7 +44,7 @@ test('mcp bridge: loopback endpoint serves tools and executes calls', async () =
     // execute round trip
     const call = await fetch(bridge.url + '/call', {
       method: 'POST',
-      headers: { authorization: 'Bearer ' + bridge.token, 'content-type': 'application/json' },
+      headers: { authorization: 'Bearer ' + bridge.token, 'content-type': 'application/json', 'X-DSH-Session': 'legacy-session' },
       body: JSON.stringify({ dshName: 'bash', arguments: { command: 'echo hi' } }),
     })
     const callBody = (await call.json()) as { ok: boolean; text: string }
@@ -75,9 +76,10 @@ test('mcp bridge script speaks JSON-RPC over stdio end to end', async () => {
     bridgeScript: resolve(here, '../dist/bridge.mjs'),
     tools: () => fakeTools,
     allowlist: () => '',
+    resolveAgent: (id) => id === 'legacy-session' ? { id } : undefined,
   })
   const child = spawn(process.execPath, [bridge.bridgeScript], {
-    env: { ...process.env, DSH_MCP_URL: bridge.url, DSH_MCP_TOKEN: bridge.token },
+    env: { ...process.env, DSH_MCP_URL: bridge.url, DSH_MCP_TOKEN: bridge.token, DSH_MCP_SESSION: 'legacy-session' },
     stdio: ['pipe', 'pipe', 'inherit'],
   })
   const lines: string[] = []
@@ -127,6 +129,7 @@ test('writeMcpConfig merges and restores the MCP registry', async () => {
     bridgeScript: '/opt/bridge.mjs',
     tools: () => undefined,
     allowlist: () => '',
+    resolveAgent: (id) => id === 'legacy-session' ? { id } : undefined,
   })
   try {
     const restore = writeMcpConfig(file, bridge)

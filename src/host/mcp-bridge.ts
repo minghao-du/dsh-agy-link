@@ -24,10 +24,18 @@ import { homedir } from 'node:os'
 
 const MCP_SERVER_KEY = 'dsh-tools'
 
+export interface BridgeToolExecutionInput {
+  callId: string
+  name: string
+  arguments: unknown
+  agent?: unknown
+  signal: AbortSignal
+}
+
 /** Minimal structural view of the DSH tool registry we need. */
 export interface ToolsServiceLike {
-  schemas(): Array<{ name: string; description: string; parameters: Record<string, unknown> }>
-  execute(input: { callId: string; name: string; arguments: unknown; agent?: unknown }): Promise<unknown>
+  schemas(agent?: unknown): Array<{ name: string; description: string; parameters: Record<string, unknown> }>
+  execute(input: BridgeToolExecutionInput): Promise<unknown>
 }
 
 /** MCP tool names are [a-zA-Z0-9_-]; DSH names may contain dots. */
@@ -43,6 +51,11 @@ export interface McpBridge {
   /** Base URL of the loopback endpoint. */
   url: string
   port: number
+  registerRun(input: {
+    sessionId: string
+    signal: AbortSignal
+    allowedTools?: readonly string[]
+  }): { token: string; dispose(): Promise<void> }
   close(): Promise<void>
 }
 
@@ -92,10 +105,68 @@ export function startMcpBridge(opts: {
   allowlist: () => string
   /** Map the spawning DSH session id to the agent the call runs on behalf of. */
   resolveAgent?: (sessionId: string) => unknown | Promise<unknown>
+  /** Hosted execution must not silently downgrade to the legacy session header. */
+  requireRun?: () => boolean
+  /** Use the host's supported transport (for example PTC) without bypassing policy. */
+  executeTool?: (input: BridgeToolExecutionInput) => Promise<unknown>
   log?: (msg: string) => void
 }): Promise<McpBridge> {
   const token = randomBytes(24).toString('hex')
   let callSeq = 0
+  let closing = false
+  let closePromise: Promise<void> | undefined
+  const shutdown = new AbortController()
+  const activeCalls = new Set<Promise<unknown>>()
+  interface Run {
+    sessionId: string
+    allowedTools?: ReadonlySet<string>
+    controller: AbortController
+    active: Set<Promise<unknown>>
+    dispose(): Promise<void>
+  }
+  const runs = new Map<string, Run>()
+  const registerRun: McpBridge['registerRun'] = (input) => {
+    if (closing || input.signal.aborted || input.sessionId.trim() === '') {
+      throw new Error('cannot register an inactive MCP run')
+    }
+    const runToken = randomBytes(24).toString('hex')
+    const controller = new AbortController()
+    let disposal: Promise<void> | undefined
+    const onAbort = () => { void run.dispose() }
+    const run: Run = {
+      sessionId: input.sessionId,
+      ...(input.allowedTools === undefined ? {} : { allowedTools: new Set(input.allowedTools) }),
+      controller,
+      active: new Set(),
+      dispose() {
+        if (disposal) return disposal
+        // Revoke before waiting, so no further call can enter this run.
+        runs.delete(runToken)
+        input.signal.removeEventListener('abort', onAbort)
+        controller.abort(new Error('MCP run ended'))
+        disposal = Promise.allSettled([...run.active]).then(() => undefined)
+        return disposal
+      },
+    }
+    runs.set(runToken, run)
+    input.signal.addEventListener('abort', onAbort, { once: true })
+    if (input.signal.aborted) void run.dispose()
+    return { token: runToken, dispose: () => run.dispose() }
+  }
+  const visibleTools = (svc: ToolsServiceLike, agent: unknown, run?: Run) => {
+    const allow = opts.allowlist().split(',').map((s) => s.trim()).filter(Boolean)
+    const allowSet = new Set(allow)
+    const seen = new Set<string>()
+    return svc.schemas(agent).filter((tool) => {
+      if (tool.name === 'run_code' || tool.name === 'agy_ask') return false
+      if (allow.length > 0 && !allowSet.has(tool.name)) return false
+      if (run?.allowedTools && !run.allowedTools.has(tool.name)) return false
+      const mapped = toMcpName(tool.name)
+      if (seen.has(mapped)) return false
+      seen.add(mapped)
+      return true
+    })
+  }
   const server: Server = createServer((req, res) => {
     void (async () => {
       const url = (req.url ?? '').split('?')[0]
@@ -104,75 +175,110 @@ export function startMcpBridge(opts: {
         sendJson(res, 401, { error: 'unauthorized' })
         return
       }
-      if ((req.method === 'GET' || req.method === 'POST') && (url === '/tools' || url === '/mcp/tools')) {
-        const svc = opts.tools()
-        if (!svc) {
-          sendJson(res, 503, { error: 'tools service unavailable' })
-          return
-        }
-        const allow = opts.allowlist().split(',').map((s) => s.trim()).filter(Boolean)
-        const allowSet = new Set(allow)
-        const seen = new Set<string>()
-        const tools = svc.schemas()
-          .filter((t) => allow.length === 0 || allowSet.has(t.name))
-          .filter((t) => {
-            // internal transports and our own ask tool are not bridgeable
-            if (t.name === 'run_code' || t.name === 'agy_ask') return false
-            const mapped = toMcpName(t.name)
-            if (seen.has(mapped)) return false // collision after mapping
-            seen.add(mapped)
-            return true
-          })
-          .map((t) => ({
-            name: toMcpName(t.name),
-            dshName: t.name,
-            description: t.description,
-            inputSchema: { type: 'object', ...t.parameters },
-          }))
+      if (closing) {
+        sendJson(res, 503, { error: 'bridge closing' })
+        return
+      }
+      const listing = (req.method === 'GET' || req.method === 'POST') && (url === '/tools' || url === '/mcp/tools')
+      const calling = req.method === 'POST' && (url === '/call' || url === '/mcp/call')
+      if (!listing && !calling) {
+        sendJson(res, 404, { error: 'not found' })
+        return
+      }
+      const sessionId = String(req.headers['x-dsh-session'] ?? '')
+      const runToken = String(req.headers['x-dsh-run'] ?? '')
+      const run = runToken === '' ? undefined : runs.get(runToken)
+      if (runToken === '' && (runs.size > 0 || opts.requireRun?.())) {
+        sendJson(res, 403, { error: 'run capability required' })
+        return
+      }
+      if (runToken !== '' && (!run || run.sessionId !== sessionId || run.controller.signal.aborted)) {
+        sendJson(res, 403, { error: 'invalid or expired run capability' })
+        return
+      }
+      const agent = sessionId === '' ? undefined : await Promise.resolve(opts.resolveAgent?.(sessionId))
+      if (req.aborted || res.destroyed) return
+      // Legacy listing without a caller is retained for existing MCP discovery.
+      // Execution, and all run-capability discovery, require a live caller.
+      if ((calling || run || sessionId !== '') && (agent === undefined || agent === null)) {
+        sendJson(res, 403, { error: 'unknown calling session' })
+        return
+      }
+      if (closing || run?.controller.signal.aborted) {
+        sendJson(res, 403, { error: 'MCP run ended' })
+        return
+      }
+      const svc = opts.tools()
+      if (!svc) {
+        sendJson(res, 503, { error: 'tools service unavailable' })
+        return
+      }
+      if (listing) {
+        const tools = visibleTools(svc, agent, run).map((tool) => ({
+          name: toMcpName(tool.name),
+          dshName: tool.name,
+          description: tool.description,
+          inputSchema: { type: 'object', ...tool.parameters },
+        }))
         sendJson(res, 200, { tools })
-        return;
+        return
       }
-      if (req.method === 'POST' && (url === '/call' || url === '/mcp/call')) {
-        const body = await readBody(req)
-        let parsed: { dshName?: unknown; arguments?: unknown } = {}
-        try {
-          parsed = JSON.parse(body) as typeof parsed
-        } catch {
-          sendJson(res, 400, { error: 'invalid JSON' })
-          return
-        }
-        const svc = opts.tools()
-        if (!svc) {
-          sendJson(res, 503, { error: 'tools service unavailable' })
-          return
-        }
-        const dshName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
-        if (dshName === '' || dshName === 'run_code' || dshName === 'agy_ask') {
-          sendJson(res, 400, { error: 'bad tool name' })
-          return;
-        }
-        callSeq++
-        try {
-          // Carry the caller: the session that spawned agy is the agent on
-          // whose behalf this call runs (issue #55). Without it, tools that
-          // enforce `exec.agent` reject the call.
-          const sessionId = String(req.headers['x-dsh-session'] ?? '')
-          const agent = sessionId === '' ? undefined : await Promise.resolve(opts.resolveAgent?.(sessionId))
-          const result = await svc.execute({
-            callId: 'agy-mcp-' + callSeq,
-            name: dshName,
-            arguments: parsed.arguments ?? {},
-            ...(agent === undefined ? {} : { agent }),
-          })
-          sendJson(res, 200, { ok: true, text: resultText(result) })
-        } catch (e) {
-          sendJson(res, 200, { ok: false, error: String(e) })
-        }
-        return;
+      const body = await readBody(req)
+      let parsed: { dshName?: unknown; arguments?: unknown } = {}
+      try {
+        const value: unknown = JSON.parse(body)
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object')
+        parsed = value as typeof parsed
+      } catch {
+        sendJson(res, 400, { error: 'invalid JSON' })
+        return
       }
-      sendJson(res, 404, { error: 'not found' })
+      const dshName = typeof parsed.dshName === 'string' ? parsed.dshName : ''
+      // Recompute at dispatch: cached tool discovery or a direct /call request
+      // must not bypass current allowlists or the caller's scoped visibility.
+      if (!visibleTools(svc, agent, run).some(tool => tool.name === dshName)) {
+        sendJson(res, 403, { error: 'tool is not available to this run' })
+        return
+      }
+      const disconnected = new AbortController()
+      const onDisconnect = () => {
+        if (!res.writableEnded) disconnected.abort(new Error('MCP caller disconnected'))
+      }
+      req.once('aborted', onDisconnect)
+      res.once('close', onDisconnect)
+      // Resolution/body parsing may have yielded after the socket closed.
+      if (req.aborted || res.destroyed) onDisconnect()
+      const signal = AbortSignal.any([shutdown.signal, disconnected.signal, ...(run ? [run.controller.signal] : [])])
+      if (signal.aborted) {
+        sendJson(res, 403, { error: 'MCP run ended' })
+        return
+      }
+      const execution = Promise.resolve().then(() => {
+        if (signal.aborted) throw signal.reason
+        const input = { callId: 'agy-mcp-' + (++callSeq), name: dshName, arguments: parsed.arguments ?? {}, agent, signal }
+        return opts.executeTool ? opts.executeTool(input) : svc.execute(input)
+      })
+      activeCalls.add(execution)
+      run?.active.add(execution)
+      try {
+        const result = await execution
+        const failed = signal.aborted || (result !== null && typeof result === 'object' && (result as { isError?: unknown }).isError === true)
+        const content = result && typeof result === 'object' && 'content' in result && Array.isArray(result.content)
+          ? result.content.filter((block: unknown) => block && typeof block === 'object' && (
+            ('type' in block && block.type === 'text' && 'text' in block && typeof block.text === 'string') ||
+            ('type' in block && block.type === 'image' && 'data' in block && typeof block.data === 'string' && 'mimeType' in block && typeof block.mimeType === 'string')
+          )) : undefined
+        if (!res.destroyed) sendJson(res, 200, { ok: !failed, text: resultText(result), ...(content?.length ? { content } : {}) })
+      } catch (error) {
+        if (!res.destroyed) sendJson(res, 200, { ok: false, error: String(error) })
+      } finally {
+        req.removeListener('aborted', onDisconnect)
+        res.removeListener('close', onDisconnect)
+        activeCalls.delete(execution)
+        run?.active.delete(execution)
+      }
     })().catch(() => {
-      try { sendJson(res, 500, { error: 'internal' }) } catch { /* closed */ }
+      try { if (!res.destroyed) sendJson(res, 500, { error: 'internal' }) } catch { /* closed */ }
     })
   })
   return new Promise((resolve, reject) => {
@@ -187,7 +293,17 @@ export function startMcpBridge(opts: {
         token,
         url: 'http://127.0.0.1:' + port,
         port,
-        close: () => new Promise<void>((done) => server.close(() => done())),
+        registerRun,
+        close() {
+          if (closePromise) return closePromise
+          closing = true
+          shutdown.abort(new Error('MCP bridge closed'))
+          const disposals = [...runs.values()].map(run => run.dispose())
+          const closed = new Promise<void>(done => server.close(() => done()))
+          server.closeAllConnections()
+          closePromise = Promise.all([closed, ...disposals, Promise.allSettled([...activeCalls])]).then(() => undefined)
+          return closePromise
+        },
       })
     })
   })
@@ -231,7 +347,7 @@ export function mcpServerKey(port: number): string {
  * Returns a restore function that puts the previous content back (or deletes
  * the file we created). Never throws.
  */
-export function writeMcpConfig(file: string, bridge: McpBridge): () => void {
+export function writeMcpConfig(file: string, bridge: Omit<McpBridge, 'registerRun'>): () => void {
   const key = mcpServerKey(bridge.port)
   let previous: string | null = null
   try {

@@ -65,6 +65,8 @@ export class RunRecording {
   private thoughts: Map<number, string> | null = null
   /** Isolated pool-account HOME used for this run's agy conversation DB. */
   accountHome: string | undefined = undefined
+  /** Guarded host tools and native runs never reuse each other's continuation. */
+  hostTools = false
 
   /**
    * Index of the event where the most recent span CUT (the last event the

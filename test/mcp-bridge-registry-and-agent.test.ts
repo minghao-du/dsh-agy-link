@@ -113,10 +113,10 @@ test('a bridged call carries the agent of the spawning session', async () => {
     assert.deepEqual(received.at(-1)?.agent, { id: 'agent-42', session: 'session-42' })
 
     // Unknown session: no agent, and the tool's own guard rejects the call.
+    const beforeAnonymous = received.length
     const anonymous = await call({})
-    assert.equal(anonymous.ok, false)
-    assert.match(String(anonymous.error), /require a calling agent/)
-    assert.equal(received.at(-1)?.agent, undefined)
+    assert.match(String(anonymous.error), /unknown calling session/)
+    assert.equal(received.length, beforeAnonymous, 'unbound calls never reach a tool body')
   } finally {
     await bridge.close()
   }
